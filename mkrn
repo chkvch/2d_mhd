@@ -1,0 +1,4 @@
+make clean
+make
+./flow $1 $2
+
