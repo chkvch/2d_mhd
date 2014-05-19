@@ -22,10 +22,12 @@ def do1(photodir,photostring):
 	
 	# manually specify contours
 	# levels = np.linspace(-2,2,num=30)
+
+	print 'butts'
     	
    	# construct 2d solution array, currently temperature
 	sol = np.zeros([nz,nx])
-	for j in range(1,nz):
+	for j in range(1,nz): ###################
 		row = temp[np.where(k==j)[0]] # this is a block corresponding to one k value
 		# row = omega[np.where(k==j)[0]] # this is a block corresponding to one k value
 		for m in range(1,nm+1): # adds each fourier term

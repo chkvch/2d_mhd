@@ -31,6 +31,8 @@ module fluid
 		namelist /output/ do_pgplot_xwin, output_interval, photo_interval, &
 			include_background_temperature, num_levels, do_pgplot_pngs,png_interval,&
 			plot_type
+
+		write(*,*) 'buttfuck'
 		
 		open(unit,file='inlist',action='read',delim='quote',status='old')
 		read(unit,nml=mesh)
@@ -892,4 +894,3 @@ program main
 	call evolve
 	call cleanup
 
-end program main
