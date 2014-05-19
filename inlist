@@ -1,7 +1,7 @@
 
 &mesh
 
-nz = 301 ! number of cells in z mesh
+nz = 666 ! number of cells in z mesh
 nm = 10 ! number of Fourier modes in x
 nx = 301 ! number of cells in x mesh; for visualization purposes only
 
