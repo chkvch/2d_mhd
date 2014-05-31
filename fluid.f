@@ -588,9 +588,9 @@ module fluid
 	! deal with k=1 and k=nz cases with special care: one-side finite differences using ghost points
 	do n=0,nm
 		call compute_boundary_spatial_derivatives(n)
+		call add_mag_advection_terms(1,n)
+		call add_mag_advection_terms(nz,n)
 	end do
-	call add_mag_advection_terms(1)
-	call add_mag_advection_terms(nz)
 	
 
 	! some terminal and graphical output
