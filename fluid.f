@@ -15,7 +15,7 @@ module fluid
 	double precision, dimension(:,:,:), pointer :: tdot, omegadot, magdot ! nz, nm, 2 (t_old and t)
 	double precision :: pi = 4.*atan(1.), dz, dt, time, ra, pr, a, c, dx, tau, t_bdy, &
 		roberts, chandra, tmax_anywhere
-	double precision :: nonlinear_mag_factor = 0d0	
+	double precision :: nonlinear_mag_factor = 1d0	
 	logical :: do_pgplot_xwin, do_load_state = .false., do_save_state = .true., include_background_temperature, &
 		do_pgplot_pngs, include_thermal_forcing
 	character(len=100) :: infile, outfile
@@ -572,9 +572,9 @@ module fluid
 		call compute_interior_spatial_derivatives(k,n) ! get temp_z, temp_zz, mag_z, mag_zz, etc.
 		call add_linear_terms(k,n)
 		
-		call add_linear_magnetic_terms(k,n) ! needs dJ/dz
+		call add_linear_magnetic_terms(k,n) ! needs mag_z
 
-		call compute_current(k,n) ! minus laplacian of mag
+		call compute_current(k,n) ! minus laplacian of mag ! needs mag and mag_zz
 		call compute_current_z(k,n) ! dJ/dz
 
 	end do ! loop over mode number
@@ -585,10 +585,10 @@ module fluid
 			  
 	end do ! loop over internal zones
 
+	! deal with k=1 and k=nz cases with special care: one-side finite differences using ghost points
 	do n=0,nm
 		call compute_boundary_spatial_derivatives(n)
 	end do
-	
 	call add_mag_advection_terms(1)
 	call add_mag_advection_terms(nz)
 	
