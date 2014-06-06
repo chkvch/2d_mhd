@@ -1,8 +1,10 @@
 &mesh
 
-nz = 666 ! number of cells in z mesh
-nm = 10 ! number of Fourier modes in x
-nx = 301 ! number of cells in x mesh; for visualization purposes only
+nz = 201 ! number of cells in z mesh
+nm = 50 ! number of Fourier modes in x
+nx = 201 ! number of cells in x mesh; for visualization purposes only
+
+dt_factor = 2d-1 ! dt = dt_factor * min(dt_diffusion, dt_cfl)
 
 /
 
@@ -14,19 +16,19 @@ nx = 301 ! number of cells in x mesh; for visualization purposes only
 ! initial conditions
 initial_condition_type = -10 ! if <= 0 just set up convection
 
-steps_to_take = 500000
+steps_to_take = 500000 ! 250000
 
-ra = 1d8 ! Rayleigh number
+ra = 1d6 ! Rayleigh number
 pr = 5d-1 ! Prandtl number := kappa / nu
 a = 3d0 ! aspect ratio := width/height
 
-roberts = 1d0 ! aka q.  Roberts number := kappa / eta
-chandra = 0d0 ! aka Q.  Chandrasekhar number := sigma * B0^2 * D^2 / rho_0 / nu
+ roberts = 1d0 ! aka q.  Roberts number := kappa / eta
+ chandra = 1d2 ! aka Q.  Chandrasekhar number := sigma * B0^2 * D^2 / rho_0 / nu
 
-include_thermal_forcing = .false. ! overwritten if initial_condition_type = 0 or 1
+include_thermal_forcing = .false. ! this is ignored if initial_condition_type = 0 or 1
 tau = 1d-4 ! timescale for thermal forcing
 
-! use_cfl_condition = .true.
+pure_hydro = .false.
 
 /
 
@@ -37,15 +39,16 @@ tau = 1d-4 ! timescale for thermal forcing
 
 do_pgplot_xwin = .true.
 
-do_pgplot_pngs = .true.
-png_interval = 1000
+! do_pgplot_pngs = .true.
+png_interval = 1
 
-output_interval = 50 ! terminal output AND xwin plot
-photo_interval = 2000
+output_interval = 50 ! terminal output and xwin plot
+photo_interval = 100
 
 include_background_temperature = .true. ! in plots
-num_levels = 50 ! number of regions to fill or contours to draw
+num_levels = 80 ! number of regions to fill or contours to draw
+num_mag_contours = 20
 
-plot_type = 2 ! 0 for temperature, 1 for magnetic vector potential, 2 for temp_zz
+ktrack = 69 ! for terminal output
 
 /

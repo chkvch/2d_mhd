@@ -18,7 +18,7 @@ FCopenmp = -fopenmp
 
 $(PROG) : $(PROG_OBJS)
 	$(FC) $(FCbasic) $(FCopenmp) -o $(PROG_DIR)/$(PROG) $(PROG_OBJS) \
-	$(LOAD_OTHER) -lz -L $(PGPLOT_DIR) -lpgplot -L $(X11_LIB_DIR) -lX11
+	$(LOAD_OTHER) -lz -L $(PGPLOT_DIR) -lpgplot -L $(X11_LIB_DIR) -lX11 -pg
 
 #################################################################
 
@@ -28,7 +28,7 @@ MY_FC_FLAGS = $(FCfree)
 SRC_DIR = .
 
 %.o: $(SRC_DIR)/%.f
-	 $(FC) -g $(FCbasic) $(MY_FC_FLAGS) -c $<
+	 $(FC) -fopenmp -g -pg $(FCbasic) $(MY_FC_FLAGS) -c $<
 
 clean:
 	-@rm -f *.o *.mod flow

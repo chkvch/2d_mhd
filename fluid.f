@@ -1,23 +1,26 @@
 module fluid
+
+	use omp_lib
 	
 	implicit none
 	
 	integer :: nz, nm, nx ! number of zones, number of fourier modes, number of x zones
-	integer :: output_interval, photo_interval, photo_count = 0, num_levels, png_count = 0
-	integer :: ktrack, kbdy, xwin_id, png_id, png_interval
-	integer :: step, steps_to_take, initial_condition_type, plot_type
+	integer :: output_interval, photo_interval, photo_count = 0, num_levels, png_count
+	integer :: ktrack, kbdy, xwin_id1, xwin_id2,xwin_id3,xwin_id4, xwin_id5,png_id, png_interval
+	integer :: step, steps_to_take, initial_condition_type, plot_type, num_mag_contours
 	double precision, dimension(:), pointer :: z, sub, dia, sup, work1, work2, temp_at_x, x ! nz
 	double precision, dimension(:,:), pointer :: temp, omega, stream, &
 		temp_old, omega_old, stream_old, temp_zz, omega_zz, stream_zz, temp_z, omega_z, stream_z, &
 		mag, mag_old, mag_z, mag_zz, current(:,:), current_z(:,:) ! nz, nm
-		double precision, dimension(:,:), pointer :: temp_xspace, stream_xspace, omega_xspace, &
-			cos_ncx, sin_ncx, mag_xspace, temp_zz_xspace(:,:)
+	double precision, dimension(:,:), pointer :: temp_xspace, stream_xspace, omega_xspace, &
+			cos_ncx, sin_ncx, mag_xspace, temp_zz_xspace, bx_xspace,bz_xspace, &
+			current_xspace,current_z_xspace,mag_z_xspace,mag_zz_xspace
 	double precision, dimension(:,:,:), pointer :: tdot, omegadot, magdot ! nz, nm, 2 (t_old and t)
-	double precision :: pi = 4.*atan(1.), dz, dt, time, ra, pr, a, c, dx, tau, t_bdy, &
-		roberts, chandra, tmax_anywhere
-	double precision :: nonlinear_mag_factor = 1d0	
+	double precision :: pi = 4.*atan(1.), dz, dt, time, ra, pr, a, c, dx, tau, t_bdy, dt_alfven, &
+		roberts, chandra, tmax_anywhere, &
+		dt_thermal_diffusion,dt_gravity_wave,dt_mag_diffusion,dt_diffusion_gravity, dt_factor
 	logical :: do_pgplot_xwin, do_load_state = .false., do_save_state = .true., include_background_temperature, &
-		do_pgplot_pngs, include_thermal_forcing
+		do_pgplot_pngs, include_thermal_forcing, timestep_cfl, pure_hydro = .false.
 	character(len=100) :: infile, outfile
 		
 	contains
@@ -25,12 +28,12 @@ module fluid
 	subroutine read_inlist
 		integer :: unit = 5
 		
-		namelist /mesh/ nz, nm, nx
+		namelist /mesh/ nz, nm, nx, dt_factor
 		namelist /params/ steps_to_take, ra, pr, a, tau, initial_condition_type, &
-			include_thermal_forcing, roberts, chandra
+			include_thermal_forcing, roberts, chandra, pure_hydro
 		namelist /output/ do_pgplot_xwin, output_interval, photo_interval, &
-			include_background_temperature, num_levels, do_pgplot_pngs,png_interval,&
-			plot_type
+			include_background_temperature, num_levels, do_pgplot_pngs,png_interval, &
+			num_mag_contours,ktrack
 		
 		open(unit,file='inlist',action='read',delim='quote',status='old')
 		read(unit,nml=mesh)
@@ -101,7 +104,8 @@ module fluid
 			
 	
 	subroutine initialize
-		integer :: k, ierr, pgopen, j, n
+		
+		integer :: k, ierr, pgopen, j, n, nthreads
 		allocate(z(nz), sub(nz), dia(nz), sup(nz), work1(nz), work2(nz), x(nx), temp_at_x(nz))
 		allocate(temp(nz,0:nm),omega(nz,0:nm),stream(nz,0:nm), &
 			temp_z(nz,0:nm), omega_z(nz,0:nm), stream_z(nz,0:nm), &
@@ -110,8 +114,15 @@ module fluid
 			mag(nz,0:nm), mag_z(nz,0:nm), mag_zz(nz,0:nm), current(nz,0:nm), current_z(nz,0:nm))
 		allocate(omegadot(nz,0:nm,2),tdot(nz,0:nm,2),magdot(nz,0:nm,2))
 		allocate(temp_xspace(nx,nz),stream_xspace(nx,nz),omega_xspace(nx,nz),mag_xspace(nx,nz), &
-			temp_zz_xspace(nx,nz))
+			temp_zz_xspace(nx,nz),bx_xspace(nx,nz),bz_xspace(nx,nz),&
+			current_xspace(nx,nz),current_z_xspace(nx,nz),mag_zz_xspace(nx,nz),mag_z_xspace(nx,nz))
 		allocate(cos_ncx(nm,nx),sin_ncx(nm,nx))
+	
+ 	nthreads=OMP_GET_MAX_THREADS()
+ 	write(*,*)
+ 	write(*,*) 'nthreads ', nthreads
+ 	write(*,*)
+	call omp_set_num_threads(nthreads)
 						
 		if (do_load_state) then
 			call load_state
@@ -130,7 +141,7 @@ module fluid
 	 		stream(:,:) = 0d0
 	 		omega(:,:) = 0d0
 			
-			! purely vertical field at t=0
+			! purely vertical field at t=0 (second paragraph p. 185 of Glatz)
 			mag(:,:) = 0d0
 					
 			! initialize z grid
@@ -150,8 +161,8 @@ module fluid
 				include_thermal_forcing = .false.
 			end if
 
-			call sine_perturbation(2d-1,1,0,nz) ! amplitude, mode number, k_min, k_max
-
+			call sine_perturbation(1d-2,1,1,nz) ! amplitude, mode number, k_min, k_max
+			call sine_perturbation(1d-2,8,1,nz) ! amplitude, mode number, k_min, k_max
 			
 			! initialize a spike in vorticity at midpoint in z
 ! 			do n=2,nm,2
@@ -165,11 +176,10 @@ module fluid
 			omegadot(:,:,2) = 0d0 ! initial "new" omegadot
 			magdot(:,:,1) = 0d0
 			magdot(:,:,2) = 0d0
+
+			png_count = 0
 			
 		end if ! load state or set initial conditions
-		
-		
-		ktrack = nz/2.
 
 		c = pi / a	
 		dz = 1. / (nz-1)
@@ -180,10 +190,15 @@ module fluid
 		end do
 
 		! timestep
-		dt = minval( (/ 0.9*dz**2/4, 2*pi/(50*sqrt(ra*pr)) /)) / 10 ! thermal diffusion and gravity wave time
-		dt = minval( (/ dt, 0.9*dz**2*roberts/4 /) ) ! magnetic diffusion
-		! todo add CFL constraint, both for fluid speed and Alfven speed
-		write(*,*) 'using dt = ', dt
+		dt_thermal_diffusion = dz**2/4 ! thermal diffusion time over a cell
+		dt_gravity_wave = 2*pi/(50*sqrt(ra*pr)) ! gravity wave time
+		dt_mag_diffusion = dz**2*roberts/4 ! magnetic diffusion time
+		dt_diffusion_gravity = minval( (/ dt_thermal_diffusion, dt_gravity_wave, dt_mag_diffusion  /) )
+
+		dt = dt_diffusion_gravity * dt_factor
+		timestep_cfl = .false.
+
+		write(*,*) 'initial dt = ', dt
 		
 		work1(:) = 0d0
 		work2(:) = 0d0
@@ -203,6 +218,8 @@ module fluid
 		temp_old(:,:) = 0d0
 		omega_old(:,:) = 0d0
 		stream_old(:,:) = 0d0
+		mag_z(:,:) = 0d0
+		mag_zz(:,:) = 0d0
 
 		! compute sines and cosines on x grid to speed up transform later
 		do n=1,nm
@@ -213,11 +230,20 @@ module fluid
 		end do
 		
 		if (do_pgplot_xwin) then
-			xwin_id = pgopen('/xwin')
-	        if (xwin_id .le. 0) then
-				write(*,*) 'pgopen failed to initialize device /xwin'
-				stop
+			xwin_id1 = pgopen('/xwin')
+	        if (xwin_id1 .le. 0) stop 'pgopen failed to initialize device /xwin'
+			
+			call init_colors
+
+			if(.not.pure_hydro) then
+				xwin_id2 = pgopen('/xwin')
+				xwin_id3 = pgopen('/xwin')
+! 				xwin_id4 = pgopen('/xwin')
+! 				xwin_id5 = pgopen('/xwin')
+			else if(pure_hydro) then
+				xwin_id2=pgopen('/xwin')
 			end if
+			
 			call init_colors
 		end if
 		
@@ -227,7 +253,8 @@ module fluid
 		deallocate(z, sub, dia, sup, work1, work2, stream, omega, temp, &
 		temp_old, omega_old, stream_old, omegadot, tdot, temp_zz, omega_zz, stream_zz, &
 		omega_z, temp_z, stream_z, temp_at_x, temp_xspace, omega_xspace, x, cos_ncx, sin_ncx,&
-		current,mag,mag_z,mag_zz,mag_xspace,temp_zz_xspace)
+		current,mag,mag_z,mag_zz,mag_xspace,temp_zz_xspace,bx_xspace,bz_xspace,current_xspace,&
+		current_z_xspace,mag_zz_xspace,mag_z_xspace)
 		if (do_pgplot_xwin) call pgend()
 	end subroutine cleanup
 	
@@ -260,22 +287,22 @@ module fluid
 		implicit none 
 		integer :: n
 		
-		write(*,*) 'max temperature anywhere', tmax_anywhere
-		write(*,'(6a16)') 'step', 'time', 'ktrack', 'nz', 'nm', 'nx'
-		write(*,'(i16,f16.8,4i16)') step, time, ktrack, nz, nm, nx
+! 		write(*,*) 'max temperature anywhere', tmax_anywhere
+		write(*,'(8a16)') 'step', 'time', 'ktrack', 'nz', 'nm', 'nx', 'dt', 'cfl timestep?'
+		write(*,'(i16,f16.8,4i16,es16.4,l16)') step, time, ktrack, nz, nm, nx, dt, timestep_cfl
 		
-		write(*,'(a3,6a16)') 'n', 'temperature', 'omega', 'stream', &
-			'max_abs_temp', 'tdot_now', 'tdot_old'
+		write(*,'(a3,7a16)') 'n', 'temperature', 'omega', 'stream', 'mag', &
+			'magdot_now', 'magdot_old', 'current'
 		do n=0,5
-			write(*,'(i3,6es16.6)') n, &
-				temp(ktrack,n), omega(ktrack,n), stream(ktrack,n), &
-				maxval(abs(temp(:,n))), tdot(ktrack,n,2), tdot(ktrack,n,1)
+			write(*,'(i3,7es16.6)') n, &
+				temp(ktrack,n), omega(ktrack,n), stream(ktrack,n), mag(ktrack,n), &
+				magdot(ktrack,n,2), magdot(ktrack,n,1), current(ktrack,n)
 		end do
 		write(*,*) '...snipped...'
 		do n=nm-5,nm
-			write(*,'(i3,6es16.6)') n, &
-				temp(ktrack,n), omega(ktrack,n), stream(ktrack,n), &
-				maxval(abs(temp(:,n))), tdot(ktrack,n,2), tdot(ktrack,n,1)
+			write(*,'(i3,7es16.6)') n, &
+				temp(ktrack,n), omega(ktrack,n), stream(ktrack,n), mag(ktrack,n), &
+				magdot(ktrack,n,2), magdot(ktrack,n,1), current(ktrack,n)
 		end do
 ! 		write(*,*)
 ! 		write(*,*) 'max temp @ z=1 ', maxval(temp(nz,:))
@@ -334,10 +361,10 @@ module fluid
 
 		open(16,file=trim(outfile),action='write',status='replace')
 		write(16,*) '# saved model from flow. first lines are global info, rest is hydro variables for all k and n.'
-		write(16,'(12a20)') 'nz', 'nm', 'nx', 'step', 'time', 'Ra', 'Pr', &
-			'q', 'Q', 'a', 'dt', 'photo_count'
-		write(16,'(4i20,7es20.8,i20)') nz, nm, nx, step, time, ra, pr, &
-			roberts, chandra, a, dt, photo_count
+		write(16,'(13a20)') 'nz', 'nm', 'nx', 'step', 'time', 'Ra', 'Pr', &
+			'q', 'Q', 'a', 'dt', 'photo_count', 'png_count'
+		write(16,'(4i20,7es20.8,2i20)') nz, nm, nx, step, time, ra, pr, &
+			roberts, chandra, a, dt, photo_count, png_count
 		write(16,*)
 		write(16,'(2a5, 7a24)') 'k', 'n', 'temp', 'omega', 'stream', 'mag', &
 			'tdot_old', 'omegadot_old', 'magdot_old'
@@ -360,30 +387,31 @@ module fluid
 	
 	
 	
-	subroutine compute_interior_spatial_derivatives(k,n)
-		integer, intent(in) :: k, n
+	subroutine compute_interior_spatial_derivatives(k)
+		integer, intent(in) :: k
+		integer :: n
 		! central finite differences
-		temp_zz(k,n) = (temp(k+1,n) - 2 * temp(k,n) + temp(k-1,n)) / dz**2
-		omega_zz(k,n) = (omega(k+1,n) - 2 * omega(k,n) + omega(k-1,n)) / dz**2
-		stream_zz(k,n) = (stream(k+1,n) - 2 * stream(k,n) + stream(k-1,n)) / dz**2				
-		mag_zz(k,n) = (mag(k+1,n) - 2 * mag(k,n) + mag(k-1,n)) / dz**2
+!$OMP PARALLEL DO PRIVATE(n)
+		do n=0,nm
+			temp_zz(k,n) = (temp(k+1,n) - 2 * temp(k,n) + temp(k-1,n)) / dz**2
+			omega_zz(k,n) = (omega(k+1,n) - 2 * omega(k,n) + omega(k-1,n)) / dz**2
+			stream_zz(k,n) = (stream(k+1,n) - 2 * stream(k,n) + stream(k-1,n)) / dz**2				
 		
-		temp_z(k,n) = (temp(k+1,n)-temp(k-1,n)) / 2 / dz
-		omega_z(k,n) = (omega(k+1,n)-omega(k-1,n)) / 2 / dz
-		stream_z(k,n) = (stream(k+1,n)-stream(k-1,n)) / 2 / dz
-		mag_z(k,n) = (mag(k+1,n)-mag(k-1,n)) / 2 / dz
+			temp_z(k,n) = (temp(k+1,n)-temp(k-1,n)) / 2 / dz
+			omega_z(k,n) = (omega(k+1,n)-omega(k-1,n)) / 2 / dz
+			stream_z(k,n) = (stream(k+1,n)-stream(k-1,n)) / 2 / dz
+			
+			mag_z(k,n) = (mag(k+1,n)-mag(k-1,n)) / 2 / dz
+			mag_zz(k,n) = (mag(k+1,n) - 2 * mag(k,n) + mag(k-1,n)) / dz**2
+		end do
+!$OMP END PARALLEL DO
 	end subroutine compute_interior_spatial_derivatives
-	
-	subroutine compute_current_z(k,n)
-		integer, intent(in) :: k,n
-		current_z(k,n) = (current(k+1,n) - current(k-1,n)) / 2 / dz
-	end subroutine compute_current_z
-		
+
 	subroutine compute_boundary_spatial_derivatives(n)
 		integer, intent(in) :: n
 		! centered finite differences, using ghost points (eqs. 11.37-40)
-		mag_zz(1,n) = 2 * (mag(2,n) - mag(1,n)) / dz**2
-		mag_zz(nz,n) = 2 * (mag(nz-1,n) - mag(nz,n)) / dz**2
+		mag_zz(1,n) = 2d0 * (mag(2,n) - mag(1,n)) / dz**2
+		mag_zz(nz,n) = 2d0 * (mag(nz-1,n) - mag(nz,n)) / dz**2
 		stream_z(1,n) = stream(2,n) / dz
 		stream_z(nz,n) = -1d0 * stream(nz-1,n) / dz
 		
@@ -391,7 +419,18 @@ module fluid
 		mag_z(1,n) = 0d0
 		mag_z(nz,n) = 0d0
 	end subroutine compute_boundary_spatial_derivatives
+
+	subroutine compute_current(k,n)
+		integer, intent(in) :: k, n
+		! eq. 11.33 for J_n. J(x,z,t) is expanded in sines in x
+		current(k,n) = -1d0 * (mag_zz(k,n) - mag(k,n) * (n * c)**2d0)
+	end subroutine compute_current
 	
+	subroutine compute_current_z(k,n)
+		integer, intent(in) :: k,n
+		current_z(k,n) = (current(k+1,n) - current(k-1,n)) / 2d0 / dz
+	end subroutine compute_current_z
+			
 	subroutine add_thermal_forcing(k) ! only works for stable above unstable, as written
 		integer, intent(in) :: k
 		double precision :: term
@@ -415,21 +454,32 @@ module fluid
 		integer, intent(in) :: k, n
 		! eq. 11.25 for dA_n/dt
 		! diffusion of the magnetic vector potential
-		magdot(k,n,2) = magdot(k,n,2) + 1 / roberts * (mag_zz(k,n) - (n * c)**2 * mag(k,n))
+		! eta -> 1/roberts
+		magdot(k,n,2) = magdot(k,n,2) + 1d0 / roberts * (mag_zz(k,n) - (n * c)**2d0 * mag(k,n))
 		
-		! linear part of the advection of the vector potential
-		magdot(k,n,2) = magdot(k,n,2) + stream_z(k,n)
+		! linear part of the advection of the vector potential  (second paragraph page 186)
+		if(.not.pure_hydro) magdot(k,n,2) = magdot(k,n,2) + stream_z(k,n)
 		
-		! linear part of the Lorentz torque
-		omegadot(k,n,2) = omegadot(k,n,2) + chandra * pr / roberts * current_z(k,n)
+		! linear part of the Lorentz torque (first paragraph page 186 in Glatzmaier)
+		if((k.gt.1).and.(k.lt.nz)) then ! otherwise no such thing as current_z
+			omegadot(k,n,2) = omegadot(k,n,2) + chandra * pr / roberts * current_z(k,n)
+		end if
 	end subroutine add_linear_magnetic_terms
 	
-	subroutine compute_current(k,n)
-		integer, intent(in) :: k, n
-		! eq. 11.33 for J_n. J(x,z,t) is expanded in sines in x
-		current(k,n) = -1d0 * (mag_zz(k,n) - (n * c)**2 * mag(k,n))
-	end subroutine compute_current
+	subroutine galerkin_advection(k,n,factor,timederiv,advector,advectee) 
+		! will not include an np=0 term (give Tdot one of those externally)
+		double precision, intent(inout) :: timederiv(nz,nm)
+		double precision, intent(in) :: advector(nz,nm), advectee(nz,nm)
+		integer, intent(in) :: k,n
+		double precision, intent(in) :: factor
+		integer :: np ! n prime
 		
+		! eq. 4.4
+		
+		timederiv(k,n) = 
+		
+	end subroutine
+			
 	subroutine add_advection_terms(k)
 		integer, intent(in) :: k
 		integer :: n, np
@@ -438,7 +488,7 @@ module fluid
 			tdot(k,0,2) = tdot(k,0,2) - c / 2 * np * &
 				(stream_z(k,np) * temp(k,np) + stream(k,np) * temp_z(k,np))
 		end do
-	      
+!$OMP PARALLEL DO PRIVATE(n,np)	      
 		do n=1,nm
 			! do the np=0 case separately (only Tdot gets a contribution, for npp=n)
 			tdot(k,n,2) = tdot(k,n,2) - n * c * stream(k,n) * temp_z(k,0)
@@ -447,7 +497,7 @@ module fluid
 	
 			! npp = n - np
 			   if((n-np.ge.1).and.(n-np.le.nm)) tdot(k,n,2) = tdot(k,n,2) - c / 2 * ( &
-			   -1. * np * stream_z(k,n-np) * temp(k,np) + (n-np) * stream(k,n-np) * temp_z(k,np))
+			   -1d0 * np * stream_z(k,n-np) * temp(k,np) + (n-np) * stream(k,n-np) * temp_z(k,np))
 			! npp = n + np
 			   if((n+np.ge.1).and.(n+np.le.nm)) tdot(k,n,2) = tdot(k,n,2) - c / 2 * ( &
 			   np * stream_z(k,n+np) * temp(k,np) + (n+np) * stream(k,n+np) * temp_z(k,np))
@@ -458,27 +508,28 @@ module fluid
 			! npp = n - np						
 			   if((n-np.ge.1).and.(n-np.le.nm)) then 
 				   omegadot(k,n,2) = omegadot(k,n,2) - c / 2 * & ! advection of vorticity
-				   (-1. * np * stream_z(k,n-np) * omega(k,np) + (n-np) * stream(k,n-np) * omega_z(k,np)) &				  
-				   + c / 2 * nonlinear_mag_factor * chandra * pr / roberts * & ! Lorentz torque
-				   (-1. * np * mag_z(k,n-np) * current(k,np) + (n-np) * mag(k,n-np) * current_z(k,np)) 
+				   (-1d0 * np * stream_z(k,n-np) * omega(k,np) + (n-np) * stream(k,n-np) * omega_z(k,np)) &
+				   + c / 2 * chandra * pr / roberts * & ! Lorentz torque
+				   (-1d0 * np * mag_z(k,n-np) * current(k,np) + (n-np) * mag(k,n-np) * current_z(k,np)) 
 			   end if
 			! npp = n + np
 			   if((n+np.ge.1).and.(n+np.le.nm)) then
 				   omegadot(k,n,2) = omegadot(k,n,2) - c / 2 * & ! advection of vorticity
-				   (-1. * (np * stream_z(k,n+np) * omega(k,np) + (n+np) * stream(k,n+np) * omega_z(k,np))) &
-				   + c / 2 * nonlinear_mag_factor * chandra * pr / roberts * & ! Lorentz torque
-				   (-1. * (np * mag_z(k,n+np) * current(k,np) + (n+np) * mag(k,n+np) * current_z(k,np))) 
+				   (-1d0 * (np * stream_z(k,n+np) * omega(k,np) + (n+np) * stream(k,n+np) * omega_z(k,np))) &
+				   + c / 2 * chandra * pr / roberts * & ! Lorentz torque
+				   (-1d0 * (np * mag_z(k,n+np) * current(k,np) + (n+np) * mag(k,n+np) * current_z(k,np))) 
 			   end if
 			! npp = np - n
 			   if((np-n.ge.1).and.(np-n.le.nm)) then
 				   omegadot(k,n,2) = omegadot(k,n,2) - c / 2 * & ! advection of vorticity
 				   (np * stream_z(k,np-n) * omega(k,np) + (np-n) * stream(k,np-n) * omega_z(k,np)) &
-				   + c / 2 * nonlinear_mag_factor * chandra * pr / roberts * & ! Lorentz torque
+				   + c / 2 * chandra * pr / roberts * & ! Lorentz torque
 				   (np * mag_z(k,np-n) * current(k,np) + (np-n) * mag(k,np-n) * current_z(k,np))
 			   end if
 		    
 		   end do		! loop over np
 		end do		! loop over n
+!$OMP END PARALLEL DO
 		
 	end subroutine add_advection_terms		
 		
@@ -489,28 +540,30 @@ module fluid
 		! following eq. 4.4 but with omega(k,np) -> mag(k,np) for n > 0
 	      
 		!       update magdot for all npp, now n>0 and np>0
+!$OMP PARALLEL DO PRIVATE(np)
 		do np=1,nm	! three values of npp contribute: n-np, n+np, np-n.
 		   
 		! npp = n - np						
 		   if((n-np.ge.1).and.(n-np.le.nm)) then 
 			   magdot(k,n,2) = magdot(k,n,2) &
-			   - c / 2 * nonlinear_mag_factor * & ! advection of induced vector potential
-			   (-1. * np * stream_z(k,n-np) * mag(k,np) + (n-np) * stream(k,n-np) * mag_z(k,np))		  
+			   - c / 2 * & ! advection of induced vector potential
+			   (-1d0 * np * stream_z(k,n-np) * mag(k,np) + (n-np) * stream(k,n-np) * mag_z(k,np))		  
 		   end if
 		! npp = n + np
 		   if((n+np.ge.1).and.(n+np.le.nm)) then
 			   magdot(k,n,2) = magdot(k,n,2) &
-			   - c / 2 * nonlinear_mag_factor * & ! advection of induced vector potential
-			   (-1. * (np * stream_z(k,n+np) * mag(k,np) + (n+np) * stream(k,n+np) * mag_z(k,np)))
+			   - c / 2 * & ! advection of induced vector potential
+			   (-1d0 * (np * stream_z(k,n+np) * mag(k,np) + (n+np) * stream(k,n+np) * mag_z(k,np)))
 		   end if
 		! npp = np - n
 		   if((np-n.ge.1).and.(np-n.le.nm)) then
 			   magdot(k,n,2) = magdot(k,n,2) &
-			   - c / 2 * nonlinear_mag_factor * & ! advection of induced vector potential
+			   - c / 2 * & ! advection of induced vector potential
 			   (np * stream_z(k,np-n) * mag(k,np) + (np-n) * stream(k,np-n) * mag_z(k,np))
 		   end if
 	    
 	   end do		! loop over np
+!$OMP END PARALLEL DO
 		
 	end subroutine add_mag_advection_terms		
 		
@@ -518,80 +571,166 @@ module fluid
 		integer :: k, j, n
 		temp_xspace(:,:) = 0d0 ! nx, nz
 		mag_xspace(:,:) = 0d0 ! nx, nz
-		temp_zz_xspace(:,:) = 0d0
+		temp_zz_xspace(:,:) = 0d0 ! nx, nz
 		tmax_anywhere = 0d0
-!$OMP PARALLEL DO PRIVATE(k,j,n) SHARED(temp_xspace, omega_xspace)
+		current_xspace(:,:) = 0d0
+		current_z_xspace(:,:) = 0d0
+		mag_zz_xspace(:,:) = 0d0
+		mag_z_xspace(:,:) = 0d0
+!$OMP PARALLEL DO PRIVATE(k,j,n)
 		do k=1,nz
 			do j=1,nx
 				if (include_background_temperature) then
 					temp_xspace(j,k) = temp_xspace(j,k) + temp(k,0)
 				end if
+				mag_xspace(j,k) = mag_xspace(j,k) + x(j) ! n=0 contribution B_0*x
+				temp_zz_xspace(j,k) = temp_zz_xspace(j,k) + temp_zz(k,0)
 				do n=1,nm
+					current_xspace(j,k) = current_xspace(j,k) + current(k,n) * sin_ncx(n,j)
+					current_z_xspace(j,k) = current_z_xspace(j,k) + current_z(k,n) * sin_ncx(n,j)
 					temp_xspace(j,k) = temp_xspace(j,k) + temp(k,n) * cos_ncx(n,j)
+ 					temp_zz_xspace(j,k) = temp_zz_xspace(j,k) + temp_zz(k,n) * cos_ncx(n,j)
 ! 					omega_xspace(j,k) = omega_xspace(j,k) + omega(k,n) * sin_ncx(n,j)
 					mag_xspace(j,k) = mag_xspace(j,k) + mag(k,n) * sin_ncx(n,j)
-					temp_zz_xspace(j,k) = temp_zz_xspace(j,k) + temp_zz(k,n) * sin_ncx(n,j)
+					mag_z_xspace(j,k) = mag_z_xspace(j,k) + mag_z(k,n) * sin_ncx(n,j)
+					mag_zz_xspace(j,k) = mag_zz_xspace(j,k) + mag_zz(k,n) * sin_ncx(n,j)
 	!	stream_xspace(j,k) = stream_xspace(j,k) + stream(k,n) * sin_ncx(n,j)
 				end do
-				tmax_anywhere = maxval( (/ tmax_anywhere, temp_xspace(k,j) /) )
+				tmax_anywhere = maxval( (/ tmax_anywhere, temp_xspace(j,k) /) )
 			end do
 		end do
 !$OMP END PARALLEL DO
-	end subroutine transform_to_xspace
+	end subroutine transform_to_xspace		
+	
+	subroutine set_dt_magnetic_cfl_condition
+		! see eqs. 11.30 and 11.31 in Glatz
+		integer :: k,j,n	
+		double precision :: alfven_speed_squared, alfven_speed, max_alfven_speed
+		bx_xspace(:,:) = 0d0 ! nx, nz 
+		bz_xspace(:,:) = 1d0 ! nx, nz ! including background term here
+		max_alfven_speed = 0d0
 
+!$OMP PARALLEL DO PRIVATE(k,j,n)
+		do k=1,nz
+			do j=1,nx
+				do n=1,nm
+					bx_xspace(j,k) = bx_xspace(j,k) - mag_z(k,n) * sin_ncx(n,j)
+					bz_xspace(j,k) = bz_xspace(j,k) + n * c * mag(k,n) * cos_ncx(n,j)
+				end do
+				alfven_speed_squared = 1d0 * chandra * pr / roberts * &
+					(bx_xspace(j,k)**2 + bz_xspace(j,k)**2)
+				alfven_speed = sqrt(alfven_speed_squared)
+				if(alfven_speed.gt.max_alfven_speed) max_alfven_speed = alfven_speed
+!				write(*,*) 'v2, v, maxv', alfven_speed_squared, alfven_speed, max_alfven_speed
+			end do
+		end do
+!$OMP END PARALLEL DO
+		! CFL condition
+		dt_alfven = dz / max_alfven_speed
+		if(mod(step,output_interval).eq.0) write(*,*) 'max alfven speed = ', max_alfven_speed, 'dt_alfven = ', dt_alfven
+		if (dt_diffusion_gravity.gt.dt_alfven) then
+			timestep_cfl = .true.
+			dt = dt_alfven * dt_factor
+		else
+			timestep_cfl = .false.
+			dt = dt_diffusion_gravity * dt_factor
+		end if
+	end subroutine set_dt_magnetic_cfl_condition		
+		
+		
+		
+		
+		
+		
+		
+		
 		
 		
 		
 		
 	subroutine evolve
-	integer :: k, n, np, j, ierr
+	integer :: k, n, np, j, ierr, perr
 	
 	do while (step .le. steps_to_take) ! step through time
 	   
-		! update mag
-		do k=2,nz-1
-			do n=0,nm
-				mag(k,n) = mag(k,n) + dt * 0.5 * (3 * magdot(k,n,2) - magdot(k,n,1))
-			end do
-		end do
-	   
-		! update tdot and omegadot (Eq. 3.3, 3.4, and 2.16)
-		do k=2,nz-1
+	! update tdot and omegadot (Eq. 3.3, 3.4, and 2.16)
+	do k=2,nz-1
+
+	! get temp_z, temp_zz, mag_z, mag_zz, omega_z, omega_zz, stream_z, stream_zz
+	! centered finite differences
+	call compute_interior_spatial_derivatives(k) ! does n=0,nm
 							   
 !$OMP PARALLEL DO PRIVATE(n,perr)		   
 	do n=0,nm
 		 
+!$OMP CRITICAL
 		if (isnan(temp(k,n))) then
 			call report
-			call save_one_png
+			call save_one_png(temp_xspace,0,'T')
 			stop 'got NaN in temperature'
 		end if
-		
-		call add_mag_advection_terms(k,n) ! -[(v dot del)A]_n ! function of stream and mag. see eq. 11.25, cf. eq. 4.4
-		
-		call compute_interior_spatial_derivatives(k,n) ! get temp_z, temp_zz, mag_z, mag_zz, etc.
-		call add_linear_terms(k,n)
-		
-		call add_linear_magnetic_terms(k,n) ! needs mag_z
+!$OMP END CRITICAL
+				
+		call add_linear_terms(k,n) ! initializes tdot from temp and temp_zz, and omegadot from temp, omega, and omega_zz		
 
-		call compute_current(k,n) ! minus laplacian of mag ! needs mag and mag_zz
-		call compute_current_z(k,n) ! dJ/dz
+		if(.not.pure_hydro) then
+			if(step.gt.1) then
+				call compute_current(k,n) ! minus laplacian of mag ! needs mag and mag_zz
+				call compute_current_z(k,n) ! centered difference - only works for an internal zone
+			end if
+			! otherwise leave J and J_z as zero. magdot just gets stream_z contribution
+
+! 			if((k.eq.ktrack).and.(n.eq.1))write(*,*) &
+! 				'current(ktrack,1), current_z(ktrack,1) = ', &
+! 				current(ktrack,1), current_z(ktrack,1)
+
+			! magnetic diffusion, and linear contributions to advection of mag and the lorentz torque
+			call add_linear_magnetic_terms(k,n) ! needs mag, mag_zz, stream_z, current_z
+			
+! 			if((k.eq.ktrack).and.(n.eq.1))write(*,*) &
+! 				'after add_linear_magnetic_terms on internal zones, magdot(ktrack,1,new), magdot(ktrack,1,old) = ', & 
+! 				magdot(ktrack,1,2), magdot(ktrack,1,1)
+! 				if((k.eq.ktrack).and.(n.eq.1))write(*,*)
+
+			call add_mag_advection_terms(k,n) ! -[(v dot del)A]_n ! needs mag, mag_z, stream, stream_z. see eq. 11.25, cf. eq. 4.4
+				
+		end if
 
 	end do ! loop over mode number
 !$OMP END PARALLEL DO
 
 	if (include_thermal_forcing) call add_thermal_forcing(k)
-	call add_advection_terms(k)
+
+	! update tdot (adv. of temperature) and omegadot (adv. of omega and induced mag)
+	! needs current, current_z, mag, mag_z for Lorentz torque
+	call add_advection_terms(k) 
 			  
 	end do ! loop over internal zones
 
+	if(.not.pure_hydro) then
+!$OMP PARALLEL DO PRIVATE(n)
 	! deal with k=1 and k=nz cases with special care: one-side finite differences using ghost points
-	do n=0,nm
-		call compute_boundary_spatial_derivatives(n)
+	do n=1,nm
+		call compute_boundary_spatial_derivatives(n) ! mag_z, mag_zz, and stream_z at k=1 and k=nz
+	end do
+!$OMP END PARALLEL DO	
+!$OMP PARALLEL DO PRIVATE(n)
+	do n=1,nm
+		call compute_current(1,n)
+		call compute_current(nz,n)
+! 		call compute_current_z(1,n)
+! 		call compute_current_z(nz,n)
+		call add_linear_magnetic_terms(1,n)
+		call add_linear_magnetic_terms(nz,n)
 		call add_mag_advection_terms(1,n)
 		call add_mag_advection_terms(nz,n)
 	end do
-	
+!$OMP END PARALLEL DO	
+	end if	   		   
+			   
+	temp_old = temp
+	omega_old = omega
+	stream_old = stream				
 
 	! some terminal and graphical output
 	if (mod(step,output_interval).eq.0) then
@@ -599,24 +738,47 @@ module fluid
 		call transform_to_xspace
 		call report
 	
-		if(do_pgplot_xwin) call plot(plot_type)
-		if(do_pgplot_pngs.and.(mod(step,png_interval).eq.0)) call save_one_png
+		if(do_pgplot_xwin.or.do_pgplot_pngs) then
+
+			if(do_pgplot_xwin) then
+				call pgslct(xwin_id1)
+				call plot(temp_xspace,0,'T')
+			end if
+			if(do_pgplot_pngs.and.(mod(step,png_interval).eq.0)) &
+				call save_one_png(temp_xspace,0,'T')
+			
+			if(.not.pure_hydro) then ! also plot mag
+				if(do_pgplot_xwin) then
+					call pgslct(xwin_id2)
+					call plot(mag_xspace,1,'A')
+				end if
+				if(do_pgplot_pngs.and.(mod(step,png_interval).eq.0)) &
+					call save_one_png(temp_xspace,1,'A')
+
+					if(do_pgplot_xwin) then
+						call pgslct(xwin_id3)
+						call plot(current_xspace,0,'J')
+					end if
+					if(do_pgplot_pngs.and.(mod(step,png_interval).eq.0)) &
+						call save_one_png(current_xspace,0,'J')
+					
+			end if
+			if(do_pgplot_pngs.and.(mod(step,png_interval).eq.0)) png_count = png_count + 1
+		end if
 		
-	end if	! show terminal and graphical output		
-	   
-	   
-	temp_old = temp
-	omega_old = omega
-	stream_old = stream				
-	   
+	end if	! show terminal and graphical output
+
 	! now with time derivs in hand, update temp and omega (Eq. 2.18)
 	! and mag
-	do k=2,nz-1
+	do k=1,nz
 		do n=0,nm
 			temp(k,n) = temp(k,n) + dt * 0.5 * (3 * tdot(k,n,2) - tdot(k,n,1))
-			omega(k,n) = omega(k,n) + dt  / 2 * (3 * omegadot(k,n,2) - omegadot(k,n,1))
+			omega(k,n) = omega(k,n) + dt  * 0.5 * (3 * omegadot(k,n,2) - omegadot(k,n,1))
+			if((.not.pure_hydro).and.(step.ge.1)) &
+				mag(k,n) = mag(k,n) + dt * 0.5 * (3 * magdot(k,n,2) - magdot(k,n,1))
 		end do
 	end do
+
 
 	! boundary conditions
 	if (initial_condition_type.eq.0) then
@@ -632,19 +794,27 @@ module fluid
 	! laplacian(psi_n) + omega_n = 0
 	dia(1) = 1
 	dia(nz) = 1
-!$OMP PARALLEL DO PRIVATE(n,perr) SHARED(tridiag)
+
 	do n=1,nm
 		dia(2:nz-1) = (c * n)**2 + 2. / dz**2
 		call tridiag(nz,omega(:,n),stream(:,n),sub,dia,sup,work1,work2)
 	end do
-!$OMP END PARALLEL DO	   
+
 	   
 	! advance time
 	tdot(:,:,1) = tdot(:,:,2)
+	tdot(:,:,2) = 0d0
 	omegadot(:,:,1) = omegadot(:,:,2)
-	magdot(:,:,1) = magdot(:,:,2)
+	omegadot(:,:,2) = 0d0
+	if((.not.pure_hydro).and.(step.ge.1)) then
+		magdot(:,:,1) = magdot(:,:,2)
+		magdot(:,:,2) = 0d0
+	end if
+
 	time = time + dt
 	step = step + 1
+
+	if((.not.pure_hydro).and.(mod(step,1).eq.0))call set_dt_magnetic_cfl_condition ! calculates Bx and Bz, maximum Alfven speed anywhere, and sets new dt
 	   
 	if (mod(step,photo_interval).eq.0) then
 		call save_state
@@ -712,84 +882,78 @@ module fluid
 		end do
 	end subroutine init_colors
 	
-	subroutine save_one_png
+	subroutine save_one_png(array_to_plot,plot_type,plot_name)
+		integer, intent(in) :: plot_type ! 1 for mag (just draw contours), otherwise full colormap
+		double precision, intent(in) :: array_to_plot(nx,nz)
+		character, intent(in) :: plot_name
 		integer :: pgopen
 		character(len=256) :: png_outfile
 
-			if (png_count.lt.10)	then
-				write(png_outfile,'(a10,i1)') '000', png_count
-			else if (png_count.lt.100) then
-				write(png_outfile,'(a9,i2)') '00', png_count
-			else if (png_count.lt.1000)	then
-				write(png_outfile,'(a8,i3)') '0', png_count
-			else
-				write(png_outfile,'(a7,i4)') png_count
-			end if
-			
-			png_outfile = adjustl(png_outfile)
-			png_outfile = 'png/' // trim(png_outfile)
+		if (png_count.lt.10)	then
+			write(png_outfile,'(a10,i1)') '000', png_count
+		else if (png_count.lt.100) then
+			write(png_outfile,'(a9,i2)') '00', png_count
+		else if (png_count.lt.1000)	then
+			write(png_outfile,'(a8,i3)') '0', png_count
+		else
+			write(png_outfile,'(i4)') png_count
+		end if
+		
+		png_outfile = adjustl(png_outfile)
+		png_outfile = 'png/' // trim(plot_name) // '_' // trim(png_outfile)
 
-			png_id = pgopen(trim(png_outfile) // '.png/png')
-	        if (png_id .le. 0) then
-				write(*,*) 'pgopen /png failed', png_id
-				stop
-			end if
+		png_id = pgopen(trim(png_outfile) // '.png/png')
+        if (png_id .le. 0) then
+			write(*,*) 'pgopen /png failed', png_id
+			stop
+		end if
 
-			call init_colors
+ 		call pgslct(png_id)
 			
-! 		call pgslct(png_id)
-		call plot(plot_type)
+		call plot(array_to_plot,plot_type,plot_name)
 	    call pgclos ! close this device instance
 		
 	    png_id = 0
-		png_count = png_count + 1
 		write(*,*) 'wrote ' // trim(png_outfile) // '.png'
 		
-	    if (do_pgplot_xwin) call pgslct(xwin_id) ! reselect xwindow
+	    if (do_pgplot_xwin) call pgslct(xwin_id1) ! reselect first xwindow
 	end subroutine save_one_png
 
-	subroutine plot(plot_type)
-		integer, intent(in) :: plot_type
+	subroutine plot(array_to_plot,plot_type,plot_name)
+		integer, intent(in) :: plot_type ! 1 for mag (just draw contours), otherwise full colormap
+		double precision, intent(in) :: array_to_plot(nx,nz)
+		character, intent(in) :: plot_name
         integer :: i, j, k, ierr
-		character(100) :: title
-		real :: xvar(nx), xmin, xmax, yvar(nz), ymin, ymax, zvar(nz,nx), zmin, zmax
+		character(100) :: title, annot
+		real :: xvar(nx), xmin, xmax, yvar(nz), ymin, ymax, zvar(nz,nx), zmin, zmax, alfa
 		real :: transform(6)
-		real :: z_contours(num_levels) 
+		real, pointer :: z_contours(:) 
 		logical :: dbg = .false.
 								
 		xvar = real(x)
 		yvar = real(z)
+		zvar = real(array_to_plot)
+				
+		call init_colors
 		
-		if(plot_type.eq.0) zvar = real(temp_xspace)
-		if(plot_type.eq.1) zvar = real(mag_xspace)
-		if(plot_type.eq.2) zvar = real(temp_zz_xspace)
-		
-
+		zmin = 0d0
 		zmax = 0d0
 		do k=1,nz
 			do j=1,nx
-				zmax = maxval( (/ zmax, zvar(k,j) /) )
+				if (zvar(k,j).gt.zmax) zmax = zvar(k,j)
+				if (zvar(k,j).lt.zmin) zmin = zvar(k,j)
 			end do
 		end do
-		
-		if(plot_type /= 0) then ! also have to find minimum value
-			zmin = 0d0
-			do k=1,nz
-				do j=1,nx
-					zmin = minval( (/ zmin, zvar(k,j) /) )
-				end do
-			end do
-		end if
-		
+			
 		if (dbg) write(*,*) 'zmin, zmax', zmin, zmax
 		
-		write(title,('(a5,i8,a10,es16.8,a6,es16.8)')) 'step ', step, 'time ', time, 'zmax ', zmax		
+		write(annot,('(a5,i8,a7,es12.4,a7,es12.4,a7,es12.4)')) 'step ', step, 'time ', time, 'zmin', zmin, 'zmax ', zmax		
 			
-		ymax = maxval(yvar)
-		ymin = minval(yvar) - 1d-90
+		ymax = 1d0
+		ymin = 0d0
 
-		xmax = maxval(xvar)
-		xmin = minval(xvar) - 1d-90
+		xmax = a
+		xmin = 0d0
 		
 		! the world coords of array point A(I,J) are given by
 		! X = TR(1) + TR(2)*I + TR(3)*J
@@ -802,49 +966,33 @@ module fluid
 		transform(6) = dz
 			
 		call pgbbuf ! begin buffer of pgplot commands
-		call pgsci(1) ! white
+		call pgsci(1) ! white for frame, labels, etc
 		CALL pgenv(xmin,xmax,ymin,ymax,0,1)
 		
-	
 		call pgask(.false.) ! whether or not pgplot pauses and prompts
 
-        CALL pglab('x', 'z',title)
+		! contours for drawing magnetic field lines
 
-		! 		do i=1,9
-		! 			z_contours(i) = 1d0*(i-1)/8*zmax
-		! 		end do
-		! 	 	write(*,*) z_contours
-
-! 		call pgsci(11) ! blue
-! 		call pgcont(zvar,nx,nz,1,nx,1,nz,z_contours(1),1,transform)
-! 		call pgsci(10) ! teal
-! 		call pgcont(zvar,nx,nz,1,nx,1,nz,z_contours(2:3),2,transform)
-! 		call pgsci(8) ! orange
-! 		call pgcont(zvar,nx,nz,1,nx,1,nz,z_contours(4:6),3,transform)
-! 		call pgsci(13) ! pink 
-! 		call pgcont(zvar,nx,nz,1,nx,1,nz,z_contours(7:8),2,transform)
-! 		call pgsci(2) ! red
-! 		call pgcont(zvar,nx,nz,1,nx,1,nz,z_contours(9),1,transform)
-
-! 		do i=16,24
-! 			call pgsci(i)
-! 			call pgcont(zvar,nx,nz,1,nx,1,nz,z_contours(i-15),1,transform)
-! 		end do
-
-		if(plot_type.eq.0) then
-
-			if (include_background_temperature) then
-				zmin = 0d0
-			else
-				zmin = -1d0
-			end if
-			zmax = 1d0
-		end if
-			
 		call pgscir(16,16+num_levels-1)
-		call pgimag(zvar,nx,nz,1,nx,1,nz,zmin,zmax,transform)
+		if (plot_type.eq.1) then
+			allocate(z_contours(num_mag_contours))
+			do i=1,num_mag_contours
+				alfa = 1d0 * (i-1) / num_mag_contours
+				z_contours(i) = (1-alfa) * zmin + alfa * zmax
+			end do
+			call pgcont(zvar,nx,nz,1,nx,2,nz,z_contours,num_mag_contours,transform)
+		else
+			call pgimag(zvar,nx,nz,1,nx,1,nz,zmin,zmax,transform)
+		end if
+		call pgsch(1.0)
+        CALL pglab('x', 'z','')
+		call pgmtext('t',0.5,0.5,0.5,annot)
+		call pgsch(1.5)
+		call pgmtext('t',1.5,0.5,0.5,trim(plot_name))			
+		call pgsch(1.0)			
+
 		
-		call pgslw(4) ! ~default thickness
+!		call pgslw(4) ! ~default thickness
 		call pgebuf ! dump buffer
 
 		
@@ -856,24 +1004,22 @@ program main
 
 	use fluid
 	
- 	use omp_lib, only: omp_get_max_threads
-	
-	integer :: nthreads
-	
+ 	use omp_lib
+
+	implicit none	
+
 	character(100) :: action
 	character(100) :: param
+	character(100) :: png_count_c
 	integer :: photo_num
-	
- 	nthreads=OMP_GET_MAX_THREADS()
- 	write(*,*)
- 	write(*,*) 'nthreads ', nthreads
- 	write(*,*)
 
 	call getarg(1,action)
 	call getarg(2,param)
+	call getarg(3,png_count_c)
 		
 	if (action .eq. 're') then
 		read(param,*) photo_num
+		read(png_count_c,*) png_count
 		do_load_state = .true.
 		if (photo_num.lt.10) write(infile,'(a10,i1)') 'photos/000', photo_num
 		if ((photo_num.ge.10).and.(photo_num.lt.100)) write(infile,'(a9,i2)') 'photos/00', photo_num
