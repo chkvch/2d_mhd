@@ -1,4 +1,4 @@
-tripping-octo-dubstep
+2d_mhd
 =====================
 
-my 2d hydro code
+nothing much to see here.
