@@ -5,7 +5,7 @@ import os
 def do1(photodir,photostring):
 	infile='%s/%s' % (photodir, photostring)
 
-    # best way to extract header info?
+	# extract header info from photo
 	f=open(infile,'r')
 	f.readline()
 	f.readline()
